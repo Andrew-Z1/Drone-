@@ -1,94 +1,233 @@
 import cv2
 import mediapipe as mp
 import time
+import math
 from codrone_edu.drone import Drone
-
-
-# Initialize the drone
-drone = Drone()
-drone.pair()  # Connect to the drone
-
 
 # Initialize MediaPipe hand detection
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
 mp_drawing = mp.solutions.drawing_utils
 
+# Function to detect hand poses and return movement command
+def detect_pose(landmarks):
+    # Get key landmarks
+    wrist = landmarks.landmark[mp_hands.HandLandmark.WRIST]
+    thumb_tip = landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
+    index_tip = landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+    middle_tip = landmarks.landmark[mp_hands.HandLandmark.MIDDLE_FINGER_TIP]
+    ring_tip = landmarks.landmark[mp_hands.HandLandmark.RING_FINGER_TIP]
+    pinky_tip = landmarks.landmark[mp_hands.HandLandmark.PINKY_TIP]
+    
+    # Calculate palm direction (up vs down)
+    palm_direction = wrist.y - middle_tip.y
+    
+    # Check for flip gesture - only index and middle fingers extended
+    if (index_tip.y < wrist.y and 
+        middle_tip.y < wrist.y and 
+        thumb_tip.y > index_tip.y and 
+        ring_tip.y > middle_tip.y and 
+        pinky_tip.y > middle_tip.y):
+        return "FLIP"
+    
+    # All fingers extended upward (palm facing camera) - Move Up
+    elif (thumb_tip.y < wrist.y and 
+        index_tip.y < wrist.y and 
+        middle_tip.y < wrist.y and 
+        ring_tip.y < wrist.y and 
+        pinky_tip.y < wrist.y):
+        return "UP"
+    
+    # All fingers extended downward (palm facing camera) - Move Down
+    elif (thumb_tip.y > wrist.y and 
+          index_tip.y > wrist.y and 
+          middle_tip.y > wrist.y and 
+          ring_tip.y > wrist.y and 
+          pinky_tip.y > wrist.y):
+        return "DOWN"
+    
+    # Palm facing sideways, fingers extended left - Move Left
+    elif palm_direction > 0 and thumb_tip.x < wrist.x:
+        return "LEFT"
+    
+    # Palm facing sideways, fingers extended right - Move Right
+    elif palm_direction > 0 and thumb_tip.x > wrist.x:
+        return "RIGHT"
+    
+    # Default - Hover in place
+    return "HOVER"
 
-# Open the webcam
-cap = cv2.VideoCapture(0)
+def main():
+    # Initialize the drone
+    drone = Drone()
+    drone.pair()  # Connect to the drone
+    print("Drone connected. Ready for hand detection.")
+    
+    # Open the webcam
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Could not open camera")
+        drone.close()
+        return
+    
+    # Set camera properties for better performance if supported
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    
+    # Track drone state
+    drone_is_flying = False
+    last_command_time = time.time()
+    command_cooldown = 0.5  # Time in seconds between commands
+    flip_cooldown = 3.0  # Longer cooldown for flip command
+    last_flip_time = time.time() - flip_cooldown  # Initialize to allow immediate flip
+    
+    try:
+        while True:
+            # Read a frame from the camera
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame")
+                break
+                
+            # Flip the frame horizontally for a mirror view
+            frame = cv2.flip(frame, 1)
+            
+            # Convert the frame to RGB for MediaPipe
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Process with MediaPipe
+            results = hands.process(rgb_frame)
+            
+            # Initialize variables
+            hand_detected = False
+            movement_command = "HOVER"
+            
+            # Process hand landmarks if detected
+            if results.multi_hand_landmarks:
+                hand_detected = True
+                for hand_landmarks in results.multi_hand_landmarks:
+                    mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                    
+                    # Get movement command based on hand pose
+                    movement_command = detect_pose(hand_landmarks)
+            
+            # Process drone control based on detected hand pose
+            current_time = time.time()
+            status_text = "No hand detected"
+            status_color = (0, 0, 255)
+            
+            # Take off if hand detected and drone not flying
+            if hand_detected and not drone_is_flying:
+                print("Hand detected, taking off...")
+                drone.takeoff()
+                drone_is_flying = True
+                status_text = "Hand Detected - Drone Taking Off"
+                status_color = (0, 255, 0)
+            
+            # Land if no hand detected and drone is flying
+            elif not hand_detected and drone_is_flying:
+                print("No hand detected, landing...")
+                drone.land()
+                drone_is_flying = False
+                status_text = "No Hand Detected - Drone Landing"
+                status_color = (0, 0, 255)
+            
+            # Move the drone based on pose if it's flying and cooldown period has passed
+            elif drone_is_flying and hand_detected:
+                status_text = f"Flying - {movement_command}"
+                status_color = (0, 255, 0)
+                
+                # Handle flip command with its own cooldown
+                if movement_command == "FLIP" and (current_time - last_flip_time) > flip_cooldown:
+                    print("Performing FLIP")
+                    status_text = "Flying - FLIPPING"
+                    status_color = (255, 165, 0)  # Orange color for flip
+                    
+                    # First ensure the drone is at a safe height
+                    drone.set_throttle(50)
+                    drone.move(0.5)
+                    drone.set_throttle(0)
+                    time.sleep(0.5)
+                    
+                    # Perform the flip
+                    drone.flip("front")
+                    
+                    # Update flip timestamp
+                    last_flip_time = current_time
+                    last_command_time = current_time
+                
+                # Handle other movement commands with regular cooldown
+                elif movement_command != "FLIP" and (current_time - last_command_time) > command_cooldown:
+                    if movement_command == "UP":
+                        print("Moving drone UP")
+                        drone.set_throttle(30)
+                        drone.move(0.3)
+                    elif movement_command == "DOWN":
+                        print("Moving drone DOWN")
+                        drone.set_throttle(-30)
+                        drone.move(0.3)
+                    elif movement_command == "LEFT":
+                        print("Moving drone LEFT")
+                        drone.set_roll(-30)
+                        drone.move(0.3)
+                    elif movement_command == "RIGHT":
+                        print("Moving drone RIGHT")
+                        drone.set_roll(30)
+                        drone.move(0.3)
+                    else:  # HOVER
+                        drone.set_throttle(0)
+                        drone.set_roll(0)
+                        drone.set_pitch(0)
+                        drone.set_yaw(0)
+                    
+                    # Reset all controls to zero after movement
+                    drone.set_throttle(0)
+                    drone.set_roll(0)
+                    drone.set_pitch(0)
+                    drone.set_yaw(0)
+                    
+                    last_command_time = current_time
+            
+            # Add text overlays to the frame
+            cv2.putText(frame, f"Command: {movement_command}", (50, 100), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.putText(frame, status_text, (50, 50), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 1, status_color, 2)
+            
+            # Show flip cooldown timer if applicable
+            if movement_command == "FLIP":
+                time_until_flip = max(0, flip_cooldown - (current_time - last_flip_time))
+                if time_until_flip > 0:
+                    cv2.putText(frame, f"Flip cooldown: {time_until_flip:.1f}s", (50, 150),
+                              cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 165, 0), 2)
+            
+            # Show the frame
+            try:
+                cv2.imshow("Hand Pose Drone Control", frame)
+            except Exception as e:
+                print(f"Display error: {e}")
+                break
+            
+            # Check for exit key
+            if cv2.waitKey(5) & 0xFF == ord('q'):
+                break
+                
+    except KeyboardInterrupt:
+        print("\nProgram interrupted by user.")
+    except Exception as e:
+        print(f"Error in main loop: {e}")
+    finally:
+        # Safety measures - make sure drone lands
+        if drone_is_flying:
+            print("Landing drone before exit")
+            drone.land()
+        
+        # Clean up resources
+        cap.release()
+        cv2.destroyAllWindows()
+        drone.close()
+        print("Program terminated safely")
 
-
-print("Waiting for hand to be detected...")
-
-
-# Track drone state
-drone_is_flying = False  # Variable to track whether the drone is flying
-
-
-try:
-   while True:
-       # Read a frame from the camera
-       ret, frame = cap.read()
-
-
-       if not ret:
-           print("Failed to grab frame")
-           break
-
-
-       # Flip the frame horizontally for a later mirror view
-       frame = cv2.flip(frame, 1)
-
-
-       # Convert the frame to RGB for MediaPipe
-       rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-       results = hands.process(rgb_frame)
-
-
-       # Initialize hand_detected to False before checking
-       hand_detected = False
-
-
-       # Draw landmarks if a hand is detected
-       if results.multi_hand_landmarks:
-           hand_detected = True
-           for hand_landmarks in results.multi_hand_landmarks:
-               mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-
-       # If a hand is detected, take off the drone, else land
-       if hand_detected and not drone_is_flying:
-           print("Hand detected, taking off...")
-           drone.takeoff()  # Take off the drone
-           drone_is_flying = True  # Update the drone state
-           cv2.putText(frame, "Hand Detected - Drone Taking Off", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-       elif not hand_detected and drone_is_flying:
-           print("No hand detected, landing...")
-           drone.land()  # Land the drone
-           drone_is_flying = False  # Update the drone state
-           cv2.putText(frame, "No Hand Detected - Drone Landing", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-
-       # Show the webcam feed with the hand landmarks drawn
-       cv2.imshow("Hand Detection", frame)
-
-
-       # Exit on pressing 'q'
-       if cv2.waitKey(1) & 0xFF == ord('q'):
-           break
-
-
-except KeyboardInterrupt:
-   print("Program stopped by user. Attempting to land safely...")
-   drone.land()  # Safely land the drone
-
-
-# Release the camera and close the window
-cap.release()
-cv2.destroyAllWindows()
-
- 
-# Disconnect the drone after the program ends
-drone.close()
-
+if __name__ == "__main__":
+    main()
