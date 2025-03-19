@@ -1,0 +1,94 @@
+import cv2
+import mediapipe as mp
+import time
+from codrone_edu.drone import Drone
+
+
+# Initialize the drone
+drone = Drone()
+drone.pair()  # Connect to the drone
+
+
+# Initialize MediaPipe hand detection
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+mp_drawing = mp.solutions.drawing_utils
+
+
+# Open the webcam
+cap = cv2.VideoCapture(0)
+
+
+print("Waiting for hand to be detected...")
+
+
+# Track drone state
+drone_is_flying = False  # Variable to track whether the drone is flying
+
+
+try:
+   while True:
+       # Read a frame from the camera
+       ret, frame = cap.read()
+
+
+       if not ret:
+           print("Failed to grab frame")
+           break
+
+
+       # Flip the frame horizontally for a later mirror view
+       frame = cv2.flip(frame, 1)
+
+
+       # Convert the frame to RGB for MediaPipe
+       rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+       results = hands.process(rgb_frame)
+
+
+       # Initialize hand_detected to False before checking
+       hand_detected = False
+
+
+       # Draw landmarks if a hand is detected
+       if results.multi_hand_landmarks:
+           hand_detected = True
+           for hand_landmarks in results.multi_hand_landmarks:
+               mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+
+       # If a hand is detected, take off the drone, else land
+       if hand_detected and not drone_is_flying:
+           print("Hand detected, taking off...")
+           drone.takeoff()  # Take off the drone
+           drone_is_flying = True  # Update the drone state
+           cv2.putText(frame, "Hand Detected - Drone Taking Off", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+       elif not hand_detected and drone_is_flying:
+           print("No hand detected, landing...")
+           drone.land()  # Land the drone
+           drone_is_flying = False  # Update the drone state
+           cv2.putText(frame, "No Hand Detected - Drone Landing", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+
+       # Show the webcam feed with the hand landmarks drawn
+       cv2.imshow("Hand Detection", frame)
+
+
+       # Exit on pressing 'q'
+       if cv2.waitKey(1) & 0xFF == ord('q'):
+           break
+
+
+except KeyboardInterrupt:
+   print("Program stopped by user. Attempting to land safely...")
+   drone.land()  # Safely land the drone
+
+
+# Release the camera and close the window
+cap.release()
+cv2.destroyAllWindows()
+
+ 
+# Disconnect the drone after the program ends
+drone.close()
+
